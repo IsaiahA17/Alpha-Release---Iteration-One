@@ -1,0 +1,81 @@
+name: Deploy To EC2
+
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push or pull request events but only for the "main" branch
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+  
+permissions:
+  id-token: write #Write permission required to authenticate with OIDC
+  
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  ConnectToEC2:
+    runs-on: ubuntu-latest 
+    
+    steps:
+      - name: Configure AWS Credentials #Configure AWS Credentaials, using IAM role and Set Up using OIDC
+        uses: aws-actions/configure-aws-credentials@main 
+        with:
+          role-to-assume: ${{ secrets.EC2_ACCESS_ROLE_ARN }}
+          aws-region: eu-west-1
+      - name: Start EC2
+        run: | #AWS CLI github action to start ec2 instance with a given ID
+          aws ec2 start-instances --instance-ids ${{ secrets.EC2_INSTANCE_ID }}
+      - name: Wait For EC2 To Run
+        run: | #Wait for instance to run before starting commands
+          aws ec2 wait instance-running \
+          --instance-ids ${{ secrets.EC2_INSTANCE_ID }}
+      - name: Run Commands as ubuntu
+        run: | #Run command specified in parameter. AWS SSM list-command-invocations takes the status of the command run
+          command_id=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=[
+            \"bash /home/ubuntu/run_eca_categories.sh ${{ vars.CATEGORY }} ${{ vars.CORE_COUNT }} ${{ vars.TIME_BUDGET }} ${{ vars.DEBUG_MODE }} ${{ vars.TESTCOV_SETTING }} ${{ vars.STACK_SIZE }}\"
+            ]" \
+            --targets "Key=instanceIds,Values=${{ secrets.EC2_INSTANCE_ID }}" \
+            --query "Command.CommandId" \
+            --output text)
+
+          # Place in loop to until the script either, fails, times out or succeeds. Checks on the command every 2 minutes. 
+          #list-command-invocations can see the current state of the command sent to run on the EC2
+          while true; do
+            status=$(aws ssm list-command-invocations \
+              --command-id "$command_id" \
+              --query "CommandInvocations[0].Status" \
+              --output text)
+
+            echo "Current command status: $status"
+
+            if [[ "$status" == "Success" || "$status" == "Failed" || "$status" == "TimedOut" ]]; then
+              break
+            fi
+
+            sleep 120
+          done
+
+          # Print SSM output for debugging using list-command-invocations 
+          aws ssm list-command-invocations \
+            --command-id "$command_id" \
+            --details \
+            --query "CommandInvocations[0].CommandPlugins[0].Output" \
+            --output text
+
+      - name: Invoke Lambda Function For Processing #Invokes Lambda using name 
+        run: |
+          aws lambda invoke --function-name ${{ secrets.LAMBDA_NAME }} \
+          --cli-binary-format raw-in-base64-out \
+          --payload '{ }' response.json #requires payload format that will be read into the lambda to be specified 
+          URL=$(jq -r '.body | fromjson | .url' response.json) #Using the jq JSON command line processor to isolate the value of the url key
+          echo "$URL" | awk -F '?' '{print $1}' #Using the text processor awk to try and remove the unnecessary parts of the html url
+                
+      - name: Stop EC2 #Keeping this commented for further testing to check the results of the pipeline commands
+        run: |
+           aws ec2 stop-instances \
+            --instance-ids ${{ secrets.EC2_INSTANCE_ID }}
